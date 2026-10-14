@@ -10,6 +10,7 @@ from loguru import logger
 from .service_context import ServiceContext
 from .websocket_handler import WebSocketHandler
 from .proxy_handler import ProxyHandler
+from .pwa import create_pwa_router
 
 
 def init_client_ws_route(default_context_cache: ServiceContext) -> APIRouter:
@@ -252,3 +253,8 @@ def init_webtool_routes(default_context_cache: ServiceContext) -> APIRouter:
             await websocket.close()
 
     return router
+
+
+def init_pwa_router(www_dir: str = "www") -> APIRouter:
+    """Create and return PWA router for mobile/web access."""
+    return create_pwa_router(www_dir=www_dir)
