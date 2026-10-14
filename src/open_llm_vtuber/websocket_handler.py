@@ -27,6 +27,8 @@ from .conversations.conversation_handler import (
     handle_group_interrupt,
     handle_individual_interrupt,
 )
+from .lifecycle import get_nova
+from .security import get_rate_limiter, RateLimitConfig
 
 
 class MessageType(Enum):
@@ -69,6 +71,13 @@ class WebSocketHandler:
         self.current_conversation_tasks: Dict[str, Optional[asyncio.Task]] = {}
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
+        
+        # Rate limiter for connections
+        self.rate_limiter = get_rate_limiter(RateLimitConfig(
+            requests_per_window=50,
+            window_seconds=60,
+            burst_allowance=10,
+        ))
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
@@ -110,6 +119,13 @@ class WebSocketHandler:
         Raises:
             Exception: If initialization fails
         """
+        # Rate limit check
+        allowed, info = self.rate_limiter.check_rate_limit(f"ws_connect:{client_uid}")
+        if not allowed:
+            logger.warning(f"Rate limit exceeded for client {client_uid}")
+            await websocket.close(code=4008, reason="Rate limit exceeded")
+            return
+
         try:
             session_service_context = await self._init_service_context(
                 websocket.send_text, client_uid
@@ -122,6 +138,12 @@ class WebSocketHandler:
             await self._send_initial_messages(
                 websocket, client_uid, session_service_context
             )
+
+            nova = get_nova()
+            if nova._running:
+                await self._dispatch_lifecycle_event(
+                    "client_connect", client_uid=client_uid
+                )
 
             logger.info(f"Connection established for client {client_uid}")
 
@@ -279,6 +301,7 @@ class WebSocketHandler:
 
     async def handle_disconnect(self, client_uid: str) -> None:
         """Handle client disconnection"""
+        await self._dispatch_lifecycle_event("client_disconnect", client_uid=client_uid)
         group = self.chat_group_manager.get_client_group(client_uid)
         if group:
             await handle_group_interrupt(
@@ -314,6 +337,53 @@ class WebSocketHandler:
 
         logger.info(f"Client {client_uid} disconnected")
         message_handler.cleanup_client(client_uid)
+
+    async def _dispatch_lifecycle_event(self, event: str, **kwargs) -> None:
+        try:
+            nova = get_nova()
+            if not nova._running:
+                return
+            if event == "client_connect":
+                if hasattr(nova, "parasocial_crm"):
+                    try:
+                        nova.parasocial_crm.record_interaction(
+                            kwargs.get("client_uid", ""), "", ""
+                        )
+                    except Exception:
+                        pass
+            elif event == "chat_message":
+                username = kwargs.get("username", "")
+                message = kwargs.get("message", "")
+                if hasattr(nova, "counter_troll"):
+                    try:
+                        result = nova.counter_troll.evaluate_message_for_troll(
+                            username, message
+                        )
+                        if result:
+                            await self._handle_troll_trial(result)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"Lifecycle event dispatch error: {e}")
+
+    async def _handle_troll_trial(self, trial_event: dict) -> None:
+        try:
+            defendant = trial_event.get("defendant", "")
+            websocket = self.client_connections.get(defendant)
+            if websocket:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "control",
+                            "text": "troll_trial",
+                            "trial_id": trial_event.get("trial_id"),
+                            "screen_overlay": trial_event.get("screen_overlay"),
+                            "speech_prompt": trial_event.get("speech_prompt"),
+                        }
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"Failed to send troll trial event: {e}")
 
     async def _cleanup_failed_connection(self, client_uid: str) -> None:
         """Clean up failed connection data"""
